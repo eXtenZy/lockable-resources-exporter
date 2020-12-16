@@ -1,0 +1,8 @@
+polling_time: 60
+metrics_url: ""
+metrics_port: 8081
+instances:
+  - alias: "jenkins"
+    url: "http://localhost:8080"
+    user: "admin"
+    token: "super_secret_token"
