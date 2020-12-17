@@ -1,11 +1,11 @@
 import argparse
+import logging
 import os
-import time
-from urllib.parse import urlparse
-
 import requests
-from requests.exceptions import RequestException
+import time
 import yaml
+from urllib.parse import urlparse
+from requests.exceptions import RequestException
 from prometheus_client import Counter, Enum, Gauge, Summary
 from prometheus_client.exposition import start_http_server
 
@@ -44,48 +44,54 @@ def process_request(alias, url, user=None, token=None, verify=True):
 
     REQUEST_CODE.labels(alias, result.status_code).inc()
 
-    # Raise an exception if the result is not
+    # Raise an exception if the result is not usable (HTTP Code is in 400-599 range)
     result.raise_for_status()
 
-    tags = dict()
-    for resource in result.json()['resources']:
-        for tag in resource['labels'].split():
-            if tag not in tags:
-                tags[tag] = dict()
-                tags[tag]['available'] = 0
-                tags[tag]['locked'] = 0
-                tags[tag]['reserved'] = 0
+    labels = dict()
+    resources = result.json()['resources']
+
+    logging.debug(f"Found {len(resources)} resources on {alias}.")
+
+    for resource in resources:
+        for label in resource['labels'].split():
+            if label not in labels:
+                labels[label] = dict()
+                labels[label]['available'] = 0
+                labels[label]['locked'] = 0
+                labels[label]['reserved'] = 0
 
         if resource['locked']:
             STATE.labels(alias, resource['name']).state('locked')
-            for tag in resource['labels'].split():
-                tags[tag]['locked'] += 1
+            for label in resource['labels'].split():
+                labels[label]['locked'] += 1
         elif resource['reserved']:
             STATE.labels(alias, resource['name']).state('reserved')
-            for tag in resource['labels'].split():
-                tags[tag]['reserved'] += 1
+            for label in resource['labels'].split():
+                labels[label]['reserved'] += 1
         else:
             STATE.labels(alias, resource['name']).state('available')
-            for tag in resource['labels'].split():
-                tags[tag]['available'] += 1
+            for label in resource['labels'].split():
+                labels[label]['available'] += 1
 
-    for tag_name, tag_values in tags.items():
-        for key, value in tag_values.items():
-            LABELS.labels(alias, tag_name, key).set(value)
+    for label_name, label_values in labels.items():
+        for key, value in label_values.items():
+            LABELS.labels(alias, label_name, key).set(value)
 
 
 def main(configuration):
     # Start up the server to expose the metrics.
+    logging.info(f"Starting server on {configuration.metrics_url}:{configuration.metrics_port}")
     start_http_server(port=configuration.metrics_port, addr=configuration.metrics_url)
 
     while True:
         for instance in configuration.instances:
 
             try:
+                logging.info(f"Checking {instance['alias']}.")
                 process_request(**instance)
             except RequestException as exception:
-                print("Error occurred:")
-                print(exception)
+                logging.error("Error occurred:")
+                logging.exception(exception)
 
         time.sleep(settings.polling_time)
 
@@ -107,23 +113,28 @@ if __name__ == '__main__':
 
     arguments.add_argument("-t", "--polling-time", type=int, default=os.environ.get('POLLING_TIME', 60),
                            help="Interval for polling the Jenkins instance(s) for gathering data. Unit is seconds.")
-    arguments.add_argument("--metrics-url", type=str, default=os.environ.get('METRICS_URL', ''),
-                           help="Port on which to expose the gathered metrics.")
+    arguments.add_argument("--metrics-url", type=str, default=os.environ.get('METRICS_URL', '0.0.0.0'),
+                           help="Port on which to expose the gathered metrics. Default: %(default)s")
     arguments.add_argument("--metrics-port", type=int, default=os.environ.get('METRICS_PORT', 8080),
-                           help="Port on which to expose the gathered metrics.")
+                           help="Port on which to expose the gathered metrics. Default: %(default)s")
+    arguments.add_argument("-l", "--logging", dest="logLevel", default='INFO',
+                           help="Set logging level. Default: %(default)s",
+                           choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
 
     # Load configuration.
     settings = arguments.parse_args()
 
     settings.instances = list()
+    logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.getLevelName(settings.logLevel))
+    logging.debug("Parsing configuration")
 
     if settings.config is not None and os.path.isfile(settings.config):
         try:
             yaml_config = load_yaml_config(settings.config)
             settings = argparse.Namespace(**yaml_config)
         except yaml.YAMLError as e:
-            print("Error opening configuration file.")
-            print(e)
+            logging.error("Error opening configuration file.")
+            logging.error(e)
 
     else:
         jenkins_instance = dict()
@@ -139,5 +150,9 @@ if __name__ == '__main__':
                 jenkins_instance['token'] = settings.token
 
         settings.instances.append(jenkins_instance)
+
+    logging.debug(f"Found {len(settings.instances)} instances: "
+                  f"{', '.join([item['alias'] for item in settings.instances])}")
+    logging.debug(f"Polling every {settings.polling_time} seconds.")
 
     main(settings)
